@@ -1,0 +1,8 @@
+{
+  "name": "CMU Dorm Activity Management System",
+  "description": "ระบบจัดการกิจกรรมนักศึกษา สำนักงานหอพักนักศึกษา มหาวิทยาลัยเชียงใหม่ พร้อมระบบรับสมัคร ปฏิทินเรียลไทม์ และเชื่อมต่อ Google Sheets",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
