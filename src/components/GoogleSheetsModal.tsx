@@ -20,6 +20,8 @@ import {
   fetchSharedConfig,
   saveSharedConfig,
   syncAllDataToSheet,
+  fetchDataFromGoogleSheet,
+  triggerZeroLoginSheetSync,
   clearSpreadsheetInfo,
   exportToCsv,
   GOOGLE_APPS_SCRIPT_CODE
@@ -30,12 +32,14 @@ interface GoogleSheetsModalProps {
   onClose: () => void;
   activities: Activity[];
   registrations: Registration[];
+  onDataLoadedFromSheet?: (activities: Activity[], registrations: Registration[]) => void;
 }
 
 export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({
   onClose,
   activities,
-  registrations
+  registrations,
+  onDataLoadedFromSheet
 }) => {
   const [config, setConfig] = useState<SheetConfig>({
     spreadsheetId: null,
@@ -132,30 +136,87 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({
   };
 
   const handleForceSync = async () => {
-    if (!config.spreadsheetId) return;
     setIsLoading(true);
     setMessage(null);
 
     try {
-      let token = await getAccessToken();
-      if (!token) {
-        const signin = await googleSignIn();
-        token = signin?.accessToken || null;
-      }
+      if (config.webhookUrl || inputWebhookUrl) {
+        const res = await triggerZeroLoginSheetSync(inputWebhookUrl || config.webhookUrl || undefined);
+        if (res.success) {
+          setMessage({
+            type: 'success',
+            text: res.message,
+          });
+          setConfig(prev => ({ ...prev, lastSyncedAt: res.lastSyncedAt }));
+        } else {
+          setMessage({
+            type: 'error',
+            text: res.message,
+          });
+        }
+      } else if (config.spreadsheetId) {
+        let token = await getAccessToken();
+        if (!token) {
+          const signin = await googleSignIn();
+          token = signin?.accessToken || null;
+        }
 
-      if (!token) {
-        throw new Error('ไม่สามารถรับสิทธิ์เข้าถึงบัญชี Google ได้');
-      }
+        if (!token) {
+          throw new Error('ไม่สามารถรับสิทธิ์เข้าถึงบัญชี Google ได้ กรุณากรอก Web App URL เพื่อซิงค์โดยไม่ต้องล็อกอิน');
+        }
 
-      await syncAllDataToSheet(token, config.spreadsheetId, activities, registrations);
-      setMessage({
-        type: 'success',
-        text: 'ซิงค์ข้อมูลกิจกรรมและรายชื่อนักศึกษาทั้งหมดลงใน Google Sheet เรียบร้อยแล้ว'
-      });
+        await syncAllDataToSheet(token, config.spreadsheetId, activities, registrations);
+        setMessage({
+          type: 'success',
+          text: 'ซิงค์ข้อมูลกิจกรรมและรายชื่อนักศึกษาทั้งหมดลงใน Google Sheet เรียบร้อยแล้ว'
+        });
+      } else {
+        setMessage({
+          type: 'error',
+          text: 'กรุณาระบุ Web App URL หรือ Google Sheet URL ก่อนทำการซิงค์'
+        });
+      }
     } catch (err: any) {
       setMessage({
         type: 'error',
         text: err.message || 'การซิงค์ข้อมูลล้มเหลว'
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handlePullFromSheet = async () => {
+    if (!config.spreadsheetId) {
+      setMessage({
+        type: 'error',
+        text: 'ยังไม่ได้ระบุหรือเชื่อมต่อ Google Sheet'
+      });
+      return;
+    }
+    setIsLoading(true);
+    setMessage(null);
+    try {
+      const token = await getAccessToken();
+      const res = await fetchDataFromGoogleSheet(config.spreadsheetId, token || undefined);
+      if (res.success) {
+        if (onDataLoadedFromSheet) {
+          onDataLoadedFromSheet(res.activities, res.registrations);
+        }
+        setMessage({
+          type: 'success',
+          text: `ดึงข้อมูลจาก Google Sheet สำเร็จ: พบกิจกรรม ${res.activities.length} โครงการ, ผู้สมัคร ${res.registrations.length} คน`
+        });
+      } else {
+        setMessage({
+          type: 'error',
+          text: res.message || 'ไม่สามารถดึงข้อมูลจาก Google Sheet ได้'
+        });
+      }
+    } catch (err: any) {
+      setMessage({
+        type: 'error',
+        text: err.message || 'เกิดข้อผิดพลาดในการดึงข้อมูล'
       });
     } finally {
       setIsLoading(false);
@@ -396,15 +457,26 @@ export const GoogleSheetsModal: React.FC<GoogleSheetsModalProps> = ({
           {/* Quick Actions */}
           <div className="flex flex-wrap items-center gap-2 pt-1">
             {config.spreadsheetId && (
-              <button
-                type="button"
-                onClick={handleForceSync}
-                disabled={isLoading}
-                className="flex-1 min-w-[140px] flex items-center justify-center gap-1.5 py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl transition-colors disabled:opacity-50"
-              >
-                <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
-                <span>ซิงค์ข้อมูลทั้งหมดเดี๋ยวนี้</span>
-              </button>
+              <>
+                <button
+                  type="button"
+                  onClick={handlePullFromSheet}
+                  disabled={isLoading}
+                  className="flex-1 min-w-[140px] flex items-center justify-center gap-1.5 py-2 px-3 bg-sky-500 hover:bg-sky-600 text-white text-xs font-semibold rounded-xl transition-colors disabled:opacity-50 cursor-pointer shadow-xs"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+                  <span>ดึงข้อมูลจาก Google Sheet</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleForceSync}
+                  disabled={isLoading}
+                  className="flex-1 min-w-[140px] flex items-center justify-center gap-1.5 py-2 px-3 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl transition-colors disabled:opacity-50"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+                  <span>ซิงค์ข้อมูลลง Sheet</span>
+                </button>
+              </>
             )}
 
             <button

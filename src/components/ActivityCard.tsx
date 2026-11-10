@@ -99,7 +99,7 @@ export const ActivityCard: React.FC<ActivityCardProps> = ({
             <div className="flex items-center justify-between pt-1 border-t border-slate-200/60">
               <div className="flex items-center gap-1.5 text-purple-700 font-semibold">
                 <Award className="w-4 h-4 text-purple-600" />
-                <span>+{activity.hoursEarned} ชั่วโมงกิจกรรมหอ</span>
+                <span>+{activity.hoursEarned} คะแนนหอพัก</span>
               </div>
               <span className="text-[11px] text-slate-500">{activity.targetAudience}</span>
             </div>

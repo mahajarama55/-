@@ -9,13 +9,17 @@ export const loadActivities = (): Activity[] => {
   try {
     const raw = localStorage.getItem(ACTIVITIES_STORAGE_KEY);
     if (!raw) {
-      localStorage.setItem(ACTIVITIES_STORAGE_KEY, JSON.stringify(INITIAL_ACTIVITIES));
-      return INITIAL_ACTIVITIES;
+      return [];
     }
-    return JSON.parse(raw);
+    const parsed: Activity[] = JSON.parse(raw);
+    const filtered = parsed.filter(a => !['act-001', 'act-002', 'act-003', 'act-004', 'act-005'].includes(a.id));
+    if (filtered.length !== parsed.length) {
+      localStorage.setItem(ACTIVITIES_STORAGE_KEY, JSON.stringify(filtered));
+    }
+    return filtered;
   } catch (err) {
     console.error('Error loading activities:', err);
-    return INITIAL_ACTIVITIES;
+    return [];
   }
 };
 
@@ -27,23 +31,47 @@ export const saveActivities = (activities: Activity[]) => {
   }
 };
 
+export const deduplicateRegistrations = (registrations: Registration[]): Registration[] => {
+  if (!Array.isArray(registrations)) return [];
+  const seen = new Set<string>();
+  const unique: Registration[] = [];
+  for (const r of registrations) {
+    if (!r) continue;
+    const stdId = String(r.studentId || '').trim();
+    if (!stdId) continue;
+    const actKey = String(r.activityCode || r.activityId || '').trim().toLowerCase();
+    const key = `${actKey}_${stdId}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      unique.push(r);
+    }
+  }
+  return unique;
+};
+
 export const loadRegistrations = (): Registration[] => {
   try {
     const raw = localStorage.getItem(REGISTRATIONS_STORAGE_KEY);
     if (!raw) {
-      localStorage.setItem(REGISTRATIONS_STORAGE_KEY, JSON.stringify(INITIAL_REGISTRATIONS));
-      return INITIAL_REGISTRATIONS;
+      return [];
     }
-    return JSON.parse(raw);
+    const parsed: Registration[] = JSON.parse(raw);
+    const filtered = parsed.filter(r => !['reg-001', 'reg-002', 'reg-003', 'reg-004', 'reg-005', 'reg-006'].includes(r.id));
+    const deduplicated = deduplicateRegistrations(filtered);
+    if (deduplicated.length !== parsed.length) {
+      localStorage.setItem(REGISTRATIONS_STORAGE_KEY, JSON.stringify(deduplicated));
+    }
+    return deduplicated;
   } catch (err) {
     console.error('Error loading registrations:', err);
-    return INITIAL_REGISTRATIONS;
+    return [];
   }
 };
 
 export const saveRegistrations = (registrations: Registration[]) => {
   try {
-    localStorage.setItem(REGISTRATIONS_STORAGE_KEY, JSON.stringify(registrations));
+    const clean = deduplicateRegistrations(registrations);
+    localStorage.setItem(REGISTRATIONS_STORAGE_KEY, JSON.stringify(clean));
   } catch (err) {
     console.error('Error saving registrations:', err);
   }
@@ -51,14 +79,13 @@ export const saveRegistrations = (registrations: Registration[]) => {
 
 /**
  * Fetch activities from the shared backend server.
- * Ensures any edits made on an admin laptop instantly appear on students' phones!
  */
 export const fetchActivitiesFromServer = async (): Promise<Activity[]> => {
   try {
     const res = await fetch('/api/activities');
     if (res.ok) {
       const data = await res.json();
-      if (Array.isArray(data) && data.length > 0) {
+      if (Array.isArray(data)) {
         saveActivities(data);
         return data;
       }
@@ -78,8 +105,9 @@ export const fetchRegistrationsFromServer = async (): Promise<Registration[]> =>
     if (res.ok) {
       const data = await res.json();
       if (Array.isArray(data)) {
-        saveRegistrations(data);
-        return data;
+        const clean = deduplicateRegistrations(data);
+        saveRegistrations(clean);
+        return clean;
       }
     }
   } catch (err) {
@@ -91,7 +119,9 @@ export const fetchRegistrationsFromServer = async (): Promise<Registration[]> =>
 /**
  * Post registration to server (also triggers automatic Google Sheet write on server)
  */
-export const postRegistrationToServer = async (reg: Registration): Promise<{ success: boolean; sheetSynced?: boolean }> => {
+export const postRegistrationToServer = async (
+  reg: Registration
+): Promise<{ success: boolean; sheetSynced?: boolean; error?: string; registration?: Registration }> => {
   try {
     const res = await fetch('/api/registrations', {
       method: 'POST',
@@ -100,11 +130,20 @@ export const postRegistrationToServer = async (reg: Registration): Promise<{ suc
     });
     if (res.ok) {
       return await res.json();
+    } else {
+      const err = await res.json().catch(() => ({}));
+      return {
+        success: false,
+        error: err.error || 'ไม่สามารถลงทะเบียนได้ หรือรหัสนักศึกษานี้ได้ลงทะเบียนกิจกรรมนี้แล้ว'
+      };
     }
-  } catch (err) {
+  } catch (err: any) {
     console.warn('Could not post registration to server:', err);
+    return {
+      success: false,
+      error: err?.message || 'เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์'
+    };
   }
-  return { success: false };
 };
 
 /**
@@ -242,43 +281,17 @@ export const getActivityStats = (activity: Activity, registrations: Registration
   };
 };
 
-// Thai Date formatting helper
-export const formatThaiDateTime = (dateStr: string): string => {
-  if (!dateStr) return '-';
-  try {
-    const d = new Date(dateStr);
-    const months = [
-      'ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.',
-      'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'
-    ];
-    const day = d.getDate();
-    const month = months[d.getMonth()];
-    const year = d.getFullYear() + 543;
-    const hours = String(d.getHours()).padStart(2, '0');
-    const minutes = String(d.getMinutes()).padStart(2, '0');
+// Re-export Universal Date & Time helpers
+export {
+  parseAnyDate,
+  toDateKey,
+  toTimeString,
+  normalizeDateTimeString,
+  formatTimeRange,
+  formatThaiDateTime,
+  formatThaiDateOnly
+} from './dateUtils';
 
-    return `${day} ${month} ${year} เวลา ${hours}:${minutes} น.`;
-  } catch {
-    return dateStr;
-  }
-};
-
-export const formatThaiDateOnly = (dateStr: string): string => {
-  if (!dateStr) return '-';
-  try {
-    const d = new Date(dateStr);
-    const months = [
-      'มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน',
-      'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'
-    ];
-    const day = d.getDate();
-    const month = months[d.getMonth()];
-    const year = d.getFullYear() + 543;
-    return `${day} ${month} ${year}`;
-  } catch {
-    return dateStr;
-  }
-};
 
 // Request and send Browser Notification
 export const sendBrowserNotification = (title: string, body: string) => {

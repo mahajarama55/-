@@ -236,10 +236,11 @@ export const createCmuActivitySpreadsheet = async (
     }
   );
 
-  // Save globally to server so ALL devices have it!
+  // Save globally to server so ALL devices have it and server can auto-append!
   await saveSharedConfig({
     spreadsheetId,
     spreadsheetUrl,
+    googleAccessToken: token,
     lastSyncedAt: new Date().toISOString(),
   });
 
@@ -359,10 +360,8 @@ export const appendRegistrationToSheet = async (
     } catch (e) {
       console.warn('Webhook appendRegistration warning:', e);
     }
-  }
-
-  // Method 2: Google Sheets API v4 (when token and spreadsheet ID are present)
-  if (activeToken && spreadsheetId) {
+  } else if (activeToken && spreadsheetId) {
+    // Method 2: Google Sheets API v4 (fallback when webhook not used)
     try {
       const row = [
         countIndex,
@@ -461,7 +460,7 @@ export const syncAllDataToSheet = async (
       }
     );
 
-    // Registrations
+    // Registrations (Strict deduplication before pushing to Google Sheet)
     const regHeaders = [
       'ลำดับ',
       'รหัสกิจกรรม',
@@ -473,7 +472,21 @@ export const syncAllDataToSheet = async (
       'สถานะ'
     ];
 
-    const regRows = registrations.map((r, i) => [
+    const seenRegs = new Set<string>();
+    const uniqueRegs: Registration[] = [];
+    for (const r of registrations) {
+      if (!r) continue;
+      const stdId = String(r.studentId || '').trim();
+      if (!stdId) continue;
+      const actKey = String(r.activityCode || r.activityId || '').trim().toLowerCase();
+      const key = `${actKey}_${stdId}`;
+      if (!seenRegs.has(key)) {
+        seenRegs.add(key);
+        uniqueRegs.push(r);
+      }
+    }
+
+    const regRows = uniqueRegs.map((r, i) => [
       i + 1,
       r.activityCode,
       r.activityTitle,
@@ -508,6 +521,7 @@ export const syncAllDataToSheet = async (
 
     await saveSharedConfig({
       spreadsheetId,
+      googleAccessToken: token,
       lastSyncedAt: new Date().toISOString(),
     });
 
@@ -519,76 +533,363 @@ export const syncAllDataToSheet = async (
 };
 
 /**
+ * Universal Zero-Login Google Sheet Sync via Backend Server & Webhook.
+ * Works from EVERY device and browser without requiring Google sign-in!
+ */
+export const triggerZeroLoginSheetSync = async (customWebhookUrl?: string): Promise<{ success: boolean; message: string; lastSyncedAt?: string }> => {
+  const currentConfig = await fetchSharedConfig();
+  const webhookUrl = customWebhookUrl || currentConfig.webhookUrl;
+
+  if (!webhookUrl) {
+    return {
+      success: false,
+      message: 'ยังไม่ได้ระบุ Webhook URL ของ Google Sheet กรุณาวาง URL ของ Google Apps Script ในส่วนการตั้งค่าด้านล่าง',
+    };
+  }
+
+  try {
+    const res = await fetch('/api/sheets/sync-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ webhookUrl }),
+    });
+
+    const data = await res.json();
+    if (res.ok && data.success) {
+      if (data.lastSyncedAt) {
+        await saveSharedConfig({ lastSyncedAt: data.lastSyncedAt });
+      }
+      return {
+        success: true,
+        message: 'ซิงค์ข้อมูลกิจกรรมและรายชื่อนักศึกษาลง Google Sheet สำเร็จแล้ว (ไม่ต้องล็อกอิน Google)',
+        lastSyncedAt: data.lastSyncedAt,
+      };
+    } else {
+      return {
+        success: false,
+        message: data.error || 'ไม่สามารถซิงค์ข้อมูลกับ Google Sheet ได้ ตรวจสอบสิทธิ์การเข้าถึง Web App',
+      };
+    }
+  } catch (err: any) {
+    return {
+      success: false,
+      message: err.message || 'เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์',
+    };
+  }
+};
+
+/**
  * Ready-to-use Google Apps Script code for 100% automated multi-device sync
+ * Zero login required for admins or students!
  */
 export const GOOGLE_APPS_SCRIPT_CODE = `// ========================================================
 // รหัส Google Apps Script สำหรับระบบกิจกรรมหอพัก มช. (CMU Dorm)
-// วิธีใช้:
-// 1. ใน Google Sheet ของคุณ ไปที่เมนู "ส่วนขยาย (Extensions)" > "Apps Script"
-// 2. วางโค้ดนี้ทั้งหมดลงไป แล้วกดบันทึก (Save)
-// 3. กดปุ่ม "ทำให้ใช้งานได้ (Deploy)" > "การทำให้ใช้งานได้รายการใหม่ (New deployment)"
-// 4. เลือกประเภท: "เว็บแอป (Web app)"
-// 5. ช่อง "ผู้มีสิทธิ์เข้าถึง (Who has access)" ให้เลือก: "ทุกคน (Anyone)"
-// 6. คัดลอก URL เว็บแอป (Web app URL) ที่ได้ มาวางในระบบกิจกรรมหอพัก มช.
-// ทุกเครื่องจะเชื่อมต่อและบันทึกข้อมูลลง Google Sheet อัตโนมัติทันที!
+// รองรับทั้ง doGet (ดึงข้อมูล) และ doPost (บันทึกข้อมูล) อัตโนมัติจากทุกเครื่อง!
+// 
+// วิธีติดตั้ง / อัปเดต (ทำครั้งเดียว):
+// 1. ใน Google Sheet ไปที่เมนู "ส่วนขยาย (Extensions)" > "Apps Script"
+// 2. ลบโค้ดเดิมออกทั้งหมด แล้ววางโค้ดนี้ลงไป
+// 3. กดไอคอน "บันทึก (Save 💾)" หรือกด Ctrl+S
+// 4. กดปุ่มสีน้ำเงิน "ทำให้ใช้งานได้ (Deploy)" > "จัดการการทำให้ใช้งานได้ (Manage deployments)"
+// 5. กดไอคอนดินสอ "แก้ไข (Edit)" > ที่ช่องเวอร์ชันเลือก "เวอร์ชันใหม่ (New version)"
+// 6. ตรวจสอบสิทธิ์: ผู้มีสิทธิ์เข้าถึง (Who has access) = "ทุกคน (Anyone)"
+// 7. กด "ทำให้ใช้งานได้ (Deploy)"
 // ========================================================
 
+// 1. รองรับการดึงข้อมูลผ่าน GET (เรียกจากเว็บแอพ หรือเปิดในบราวเซอร์)
+function doGet(e) {
+  return handleFetchData(e);
+}
+
+// 2. รองรับการบันทึก/ซิงค์ข้อมูลผ่าน POST
 function doPost(e) {
   try {
-    var contents = JSON.parse(e.postData.contents);
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var contents = {};
+    if (e && e.postData && e.postData.contents) {
+      try {
+        contents = JSON.parse(e.postData.contents);
+      } catch (pe) {
+        contents = {};
+      }
+    }
 
-    // 1. บันทึกข้อมูลกิจกรรมใหม่
+    // กรณีเรียกดูข้อมูลผ่าน POST
+    if (contents.action === 'fetchData' || contents.action === 'getData') {
+      return handleFetchData(e);
+    }
+
+    var ss = getTargetSpreadsheet();
+
+    // กรณี A: ซิงค์ข้อมูลทั้งหมด (ทั้งกิจกรรม และรายชื่อผู้สมัคร)
+    if (contents.action === 'syncAll') {
+      var activities = contents.activities || [];
+      var registrations = contents.registrations || [];
+
+      // --- จัดการแท็บกิจกรรมทั้งหมด ---
+      var actSheet = ss.getSheetByName('กิจกรรมทั้งหมด');
+      if (!actSheet) {
+        actSheet = ss.insertSheet('กิจกรรมทั้งหมด');
+      } else {
+        actSheet.clearContents();
+      }
+
+      var actHeaders = [
+        'รหัสกิจกรรม', 'ชื่อโครงการ/กิจกรรม', 'หมวดหมู่', 'สถานที่จัด',
+        'วันเวลาเริ่มกิจกรรม', 'วันเวลาสิ้นสุด', 'จำนวนรับ (คน)',
+        'วันเปิดรับสมัคร', 'วันปิดรับสมัคร', 'กลุ่มเป้าหมาย', 'คะแนนกิจกรรม', 'วันที่บันทึกล่าสุด'
+      ];
+      var actRows = [actHeaders];
+
+      for (var i = 0; i < activities.length; i++) {
+        var a = activities[i];
+        actRows.push([
+          a.code || '',
+          a.title || '',
+          a.categoryLabel || a.category || '',
+          a.location || '',
+          a.eventDateTime || '',
+          a.eventEndDateTime || '',
+          a.maxParticipants || 0,
+          a.openDate || '',
+          a.closeDate || '',
+          a.targetAudience || '',
+          a.hoursEarned || 0,
+          new Date().toLocaleString('th-TH')
+        ]);
+      }
+      actSheet.getRange(1, 1, actRows.length, actHeaders.length).setValues(actRows);
+      actSheet.getRange(1, 1, 1, actHeaders.length).setFontWeight('bold').setBackground('#6C3994').setFontColor('#FFFFFF');
+      actSheet.setFrozenRows(1);
+
+      // --- จัดการแท็บรายชื่อผู้สมัครเข้าร่วม ---
+      var regSheet = ss.getSheetByName('รายชื่อผู้สมัครเข้าร่วม');
+      if (!regSheet) {
+        regSheet = ss.insertSheet('รายชื่อผู้สมัครเข้าร่วม');
+      } else {
+        regSheet.clearContents();
+      }
+
+      var regHeaders = [
+        'ลำดับ', 'รหัสกิจกรรม', 'ชื่อกิจกรรม', 'รหัสนักศึกษา',
+        'ชื่อ-นามสกุล', 'หอพักนักศึกษา', 'วันเวลาที่สมัคร', 'สถานะ'
+      ];
+      var regRows = [regHeaders];
+      var seenRegs = {};
+      var cleanCount = 0;
+
+      for (var j = 0; j < registrations.length; j++) {
+        var r = registrations[j];
+        var sId = String(r.studentId || '').trim();
+        var aCode = String(r.activityCode || r.activityId || '').trim();
+        var rKey = aCode + '_' + sId;
+        if (!seenRegs[rKey] && sId) {
+          seenRegs[rKey] = true;
+          cleanCount++;
+          regRows.push([
+            cleanCount,
+            r.activityCode || '',
+            r.activityTitle || '',
+            r.studentId || '',
+            r.fullName || '',
+            r.dormitory || '',
+            r.registeredAt || '',
+            r.status === 'confirmed' ? 'ยืนยันแล้ว' : (r.status || 'ยืนยันแล้ว')
+          ]);
+        }
+      }
+      regSheet.getRange(1, 1, regRows.length, regHeaders.length).setValues(regRows);
+      regSheet.getRange(1, 1, 1, regHeaders.length).setFontWeight('bold').setBackground('#6C3994').setFontColor('#FFFFFF');
+      regSheet.setFrozenRows(1);
+
+      return ContentService.createTextOutput(JSON.stringify({
+        status: 'success',
+        syncedActivities: activities.length,
+        syncedRegistrations: cleanCount,
+        syncedAt: new Date().toISOString()
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // กรณี B: เพิ่มกิจกรรมใหม่
     if (contents.action === 'addActivity') {
       var act = contents.activity;
-      var sheet = ss.getSheetByName('กิจกรรมทั้งหมด');
-      if (!sheet) {
-        sheet = ss.insertSheet('กิจกรรมทั้งหมด');
-        sheet.appendRow([
+      var aSheet = ss.getSheetByName('กิจกรรมทั้งหมด');
+      if (!aSheet) {
+        aSheet = ss.insertSheet('กิจกรรมทั้งหมด');
+        aSheet.appendRow([
           'รหัสกิจกรรม', 'ชื่อโครงการ/กิจกรรม', 'หมวดหมู่', 'สถานที่จัด',
           'วันเวลาเริ่มกิจกรรม', 'วันเวลาสิ้นสุด', 'จำนวนรับ (คน)',
           'วันเปิดรับสมัคร', 'วันปิดรับสมัคร', 'กลุ่มเป้าหมาย', 'คะแนนกิจกรรม', 'วันที่บันทึก'
         ]);
-        sheet.setFrozenRows(1);
+        aSheet.getRange(1, 1, 1, 12).setFontWeight('bold').setBackground('#6C3994').setFontColor('#FFFFFF');
+        aSheet.setFrozenRows(1);
       }
-      sheet.appendRow([
+      aSheet.appendRow([
         act.code, act.title, act.categoryLabel, act.location,
         act.eventDateTime, act.eventEndDateTime, act.maxParticipants,
         act.openDate, act.closeDate, act.targetAudience, act.hoursEarned,
-        new Date().toISOString()
+        new Date().toLocaleString('th-TH')
       ]);
       return ContentService.createTextOutput(JSON.stringify({ status: 'success' })).setMimeType(ContentService.MimeType.JSON);
     }
 
-    // 2. บันทึกข้อมูลการสมัครของนักศึกษา (อัตโนมัติจากทุกเครื่อง)
+    // กรณี C: บันทึกการสมัครของนักศึกษา (อัตโนมัติจากทุกเครื่อง)
     if (contents.action === 'addRegistration') {
-      var sheet = ss.getSheetByName('รายชื่อผู้สมัครเข้าร่วม');
-      if (!sheet) {
-        sheet = ss.insertSheet('รายชื่อผู้สมัครเข้าร่วม');
-        sheet.appendRow([
+      var rSheet = ss.getSheetByName('รายชื่อผู้สมัครเข้าร่วม');
+      if (!rSheet) {
+        rSheet = ss.insertSheet('รายชื่อผู้สมัครเข้าร่วม');
+        rSheet.appendRow([
           'ลำดับ', 'รหัสกิจกรรม', 'ชื่อกิจกรรม', 'รหัสนักศึกษา',
           'ชื่อ-นามสกุล', 'หอพักนักศึกษา', 'วันเวลาที่สมัคร', 'สถานะ'
         ]);
-        sheet.setFrozenRows(1);
+        rSheet.getRange(1, 1, 1, 8).setFontWeight('bold').setBackground('#6C3994').setFontColor('#FFFFFF');
+        rSheet.setFrozenRows(1);
       }
-      var nextRow = sheet.getLastRow();
-      sheet.appendRow([
-        contents.index || nextRow,
-        contents.activityCode,
-        contents.activityTitle,
-        contents.studentId,
-        contents.fullName,
-        contents.dormitory,
-        contents.registeredAt || new Date().toISOString(),
+      var regData = contents.registration || contents;
+      var targetStudentId = String(regData.studentId || '').trim();
+      var targetActCode = String(regData.activityCode || '').trim();
+      var targetActTitle = String(regData.activityTitle || '').trim();
+
+      // ตรวจสอบข้อมูลซ้ำซ้อน: หากมีรหัสนักศึกษานี้ในกิจกรรมนี้แล้ว จะไม่บันทึกซ้ำ
+      var lastRow = rSheet.getLastRow();
+      if (lastRow > 1) {
+        var existingData = rSheet.getRange(2, 1, lastRow - 1, 4).getValues();
+        for (var k = 0; k < existingData.length; k++) {
+          var rowActCode = String(existingData[k][1] || '').trim();
+          var rowActTitle = String(existingData[k][2] || '').trim();
+          var rowStudentId = String(existingData[k][3] || '').trim();
+          var isSameAct = (targetActCode && rowActCode === targetActCode) || (targetActTitle && rowActTitle === targetActTitle);
+          if (isSameAct && rowStudentId === targetStudentId) {
+            return ContentService.createTextOutput(JSON.stringify({
+              status: 'success',
+              duplicateIgnored: true,
+              message: 'มีข้อมูลนักศึกษาคนนี้ในกิจกรรมแล้ว (ป้องกันการบันทึกซ้ำ)'
+            })).setMimeType(ContentService.MimeType.JSON);
+          }
+        }
+      }
+
+      var nextIndex = contents.index || lastRow;
+      rSheet.appendRow([
+        nextIndex,
+        regData.activityCode,
+        regData.activityTitle,
+        regData.studentId,
+        regData.fullName,
+        regData.dormitory,
+        regData.registeredAt || new Date().toISOString(),
         'ยืนยันแล้ว'
       ]);
       return ContentService.createTextOutput(JSON.stringify({ status: 'success' })).setMimeType(ContentService.MimeType.JSON);
     }
 
-    return ContentService.createTextOutput(JSON.stringify({ status: 'unknown_action' })).setMimeType(ContentService.MimeType.JSON);
+    return handleFetchData(e);
   } catch (err) {
     return ContentService.createTextOutput(JSON.stringify({ status: 'error', message: err.toString() })).setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+// ฟังก์ชันดึงข้อมูลจาก Google Sheet ส่งกลับเป็น JSON
+function handleFetchData(e) {
+  try {
+    var ss = getTargetSpreadsheet();
+
+    // 1. อ่านแท็บ "กิจกรรมทั้งหมด"
+    var actSheet = ss.getSheetByName('กิจกรรมทั้งหมด');
+    var activities = [];
+    if (actSheet && actSheet.getLastRow() > 1) {
+      var actData = actSheet.getRange(2, 1, actSheet.getLastRow() - 1, 12).getValues();
+      for (var i = 0; i < actData.length; i++) {
+        var row = actData[i];
+        var code = String(row[0] || '').trim();
+        var title = String(row[1] || '').trim();
+        if (!code && !title) continue;
+
+        activities.push({
+          code: code,
+          title: title,
+          categoryLabel: String(row[2] || '').trim(),
+          location: String(row[3] || '').trim(),
+          eventDateTime: formatDateTime(row[4]),
+          eventEndDateTime: formatDateTime(row[5]),
+          maxParticipants: Number(row[6]) || 50,
+          openDate: formatDateTime(row[7]),
+          closeDate: formatDateTime(row[8]),
+          targetAudience: String(row[9] || '').trim(),
+          hoursEarned: Number(row[10]) || 3,
+          createdAt: String(row[11] || '').trim()
+        });
+      }
+    }
+
+    // 2. อ่านแท็บ "รายชื่อผู้สมัครเข้าร่วม"
+    var regSheet = ss.getSheetByName('รายชื่อผู้สมัครเข้าร่วม');
+    var registrations = [];
+    var seenFetchRegs = {};
+    if (regSheet && regSheet.getLastRow() > 1) {
+      var regData = regSheet.getRange(2, 1, regSheet.getLastRow() - 1, 8).getValues();
+      for (var j = 0; j < regData.length; j++) {
+        var r = regData[j];
+        var studentId = String(r[3] || '').trim();
+        var fullName = String(r[4] || '').trim();
+        var actCode = String(r[1] || '').trim();
+        if (!studentId && !fullName) continue;
+
+        var fKey = actCode + '_' + studentId;
+        if (seenFetchRegs[fKey]) continue;
+        seenFetchRegs[fKey] = true;
+
+        registrations.push({
+          index: registrations.length + 1,
+          activityCode: actCode,
+          activityTitle: String(r[2] || '').trim(),
+          studentId: studentId,
+          fullName: fullName,
+          dormitory: String(r[5] || '').trim(),
+          registeredAt: formatDateTime(r[6]),
+          status: String(r[7] || 'ยืนยันแล้ว').trim()
+        });
+      }
+    }
+
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'success',
+      activities: activities,
+      registrations: registrations,
+      count: {
+        activities: activities.length,
+        registrations: registrations.length
+      },
+      updatedAt: new Date().toISOString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  } catch (err) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: 'error',
+      message: err.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// ดึง Spreadsheet จาก Active หรือ ID โดยอัตโนมัติ
+function getTargetSpreadsheet() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (ss) return ss;
+  } catch (e) {}
+  return SpreadsheetApp.openById('1OZvweHpIqzopQPb-ISQTraC8U7BcdjJ4q-pGkBIJnBg');
+}
+
+function formatDateTime(val) {
+  if (!val) return '';
+  if (val instanceof Date || Object.prototype.toString.call(val) === '[object Date]' || typeof val.getTime === 'function') {
+    try {
+      return Utilities.formatDate(val, Session.getScriptTimeZone() || 'Asia/Bangkok', "yyyy-MM-dd'T'HH:mm");
+    } catch (e) {
+      try {
+        return val.toISOString().slice(0, 16);
+      } catch (e2) {}
+    }
+  }
+  return String(val).trim();
 }
 `;
 
@@ -621,3 +922,61 @@ export const exportToCsv = (
   link.click();
   document.body.removeChild(link);
 };
+
+/**
+ * Fetch activities and registrations directly from the connected Google Sheet
+ */
+export const fetchDataFromGoogleSheet = async (
+  spreadsheetId?: string,
+  token?: string
+): Promise<{ success: boolean; activities: Activity[]; registrations: Registration[]; message?: string }> => {
+  const currentConfig = await fetchSharedConfig();
+  const targetId = spreadsheetId || currentConfig.spreadsheetId;
+  const activeToken = token || (await getAccessToken()) || currentConfig.googleAccessToken;
+
+  if (!targetId) {
+    return {
+      success: false,
+      activities: [],
+      registrations: [],
+      message: 'ยังไม่มี Google Sheet ที่เชื่อมต่อ'
+    };
+  }
+
+  try {
+    const res = await fetch('/api/sheets/fetch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        spreadsheetId: targetId,
+        googleAccessToken: activeToken
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        success: true,
+        activities: data.activities || [],
+        registrations: data.registrations || [],
+        message: data.message
+      };
+    } else {
+      const err = await res.json().catch(() => ({}));
+      return {
+        success: false,
+        activities: [],
+        registrations: [],
+        message: err.error || 'ไม่สามารถดึงข้อมูลจาก Google Sheet ได้'
+      };
+    }
+  } catch (e: any) {
+    return {
+      success: false,
+      activities: [],
+      registrations: [],
+      message: e.message || 'เกิดข้อผิดพลาดในการเชื่อมต่อเซิร์ฟเวอร์'
+    };
+  }
+};
+

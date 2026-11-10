@@ -155,10 +155,9 @@ export const Navbar: React.FC<NavbarProps> = ({
             </button>
           </nav>
 
-            {/* Google Sheet Sync Action */}
-              {/* Right Action Buttons */}
+          {/* Right Action Buttons */}
           <div className="flex items-center gap-2 sm:gap-3">
-  
+           
 
             {/* Notification Bell Dropdown */}
             <div className="relative">

@@ -14,7 +14,8 @@ import {
   PlusCircle,
   Clock,
   CheckCircle2,
-  ExternalLink
+  ExternalLink,
+  RefreshCw
 } from 'lucide-react';
 import { Activity, Registration, NotificationItem } from './types';
 import {
@@ -22,6 +23,7 @@ import {
   saveActivities,
   loadRegistrations,
   saveRegistrations,
+  deduplicateRegistrations,
   loadNotifications,
   saveNotifications,
   getActivityStats,
@@ -44,8 +46,14 @@ import { AdminPanel } from './components/AdminPanel';
 import { MyRegistrationsModal } from './components/MyRegistrationsModal';
 import { DormStatsModal } from './components/DormStatsModal';
 import { GoogleSheetsModal } from './components/GoogleSheetsModal';
+import { LiveChatWidget } from './components/LiveChatWidget';
 import { initAuth } from './services/firebaseAuth';
-import { getSavedSpreadsheetUrl, fetchSharedConfig, appendRegistrationToSheet, appendActivityToSheet } from './services/googleSheets';
+import {
+  getSavedSpreadsheetUrl,
+  fetchSharedConfig,
+  fetchDataFromGoogleSheet
+} from './services/googleSheets';
+import { parseAnyDate } from './utils/storage';
 
 export default function App() {
   // Main Data States
@@ -73,7 +81,11 @@ export default function App() {
   const [isAddModalOpen, setIsAddModalOpen] = useState<boolean>(false);
   const [isGoogleSheetModalOpen, setIsGoogleSheetModalOpen] = useState<boolean>(false);
 
-  // Load initial data and sync with server
+  // Pulling from Google Sheet State
+  const [isPullingSheet, setIsPullingSheet] = useState<boolean>(false);
+  const [sheetPullToast, setSheetPullToast] = useState<string | null>(null);
+
+  // Load initial data and sync with Google Sheet as primary data source
   useEffect(() => {
     // 1. Initial fast local load
     const loadedActs = loadActivities();
@@ -84,28 +96,44 @@ export default function App() {
     setRegistrations(loadedRegs);
     setNotifications(loadedNotes);
 
-    // 2. Fetch shared config (Google Sheet settings) from backend so every device connects automatically
-    fetchSharedConfig().catch(() => {});
-
-    // 3. Fetch latest shared activities and registrations from backend server
-    const syncWithServer = async () => {
+    // 2. Fetch shared config & pull directly from Google Sheet if connected
+    const syncData = async () => {
       try {
+        const cfg = await fetchSharedConfig().catch(() => null);
+
+        // Priority 1: Pull from Google Sheet if connected
+        if (cfg?.spreadsheetId) {
+          const sheetResult = await fetchDataFromGoogleSheet(cfg.spreadsheetId);
+          if (sheetResult.success) {
+            const cleanRegs = deduplicateRegistrations(sheetResult.registrations);
+            setActivities(sheetResult.activities);
+            setRegistrations(cleanRegs);
+            saveActivities(sheetResult.activities);
+            saveRegistrations(cleanRegs);
+            return;
+          }
+        }
+
+        // Priority 2: Fetch shared backend server DB
         const [serverActs, serverRegs] = await Promise.all([
           fetchActivitiesFromServer(),
           fetchRegistrationsFromServer()
         ]);
-        if (serverActs && serverActs.length > 0) setActivities(serverActs);
-        if (serverRegs) setRegistrations(serverRegs);
+        if (Array.isArray(serverActs)) setActivities(serverActs);
+        if (Array.isArray(serverRegs)) {
+          const cleanRegs = deduplicateRegistrations(serverRegs);
+          setRegistrations(cleanRegs);
+        }
       } catch (e) {
-        console.warn('Server sync error:', e);
+        console.warn('Sync error:', e);
       }
     };
 
-    syncWithServer();
+    syncData();
 
-    // Periodic live sync every 10 seconds so changes on one device show on another
-    const interval = setInterval(syncWithServer, 10000);
-    window.addEventListener('focus', syncWithServer);
+    // Periodic live sync every 15 seconds
+    const interval = setInterval(syncData, 15000);
+    window.addEventListener('focus', syncData);
 
     // Initialize Firebase Auth listener
     initAuth(
@@ -117,9 +145,38 @@ export default function App() {
 
     return () => {
       clearInterval(interval);
-      window.removeEventListener('focus', syncWithServer);
+      window.removeEventListener('focus', syncData);
     };
   }, []);
+
+  // Manual Pull from Google Sheet handler
+  const handlePullFromSheet = async () => {
+    setIsPullingSheet(true);
+    try {
+      const cfg = await fetchSharedConfig();
+      if (!cfg.spreadsheetId) {
+        setSheetPullToast('ยังไม่มี Google Sheet ที่เชื่อมต่อในระบบ กรุณากดเชื่อมต่อในเมนูตั้งค่า');
+        setTimeout(() => setSheetPullToast(null), 4000);
+        return;
+      }
+      const res = await fetchDataFromGoogleSheet(cfg.spreadsheetId);
+      if (res.success) {
+        const cleanRegs = deduplicateRegistrations(res.registrations);
+        setActivities(res.activities);
+        setRegistrations(cleanRegs);
+        saveActivities(res.activities);
+        saveRegistrations(cleanRegs);
+        setSheetPullToast(`ดึงข้อมูลจาก Google Sheet สำเร็จ: พบกิจกรรม ${res.activities.length} โครงการ, ผู้สมัคร ${cleanRegs.length} คน`);
+      } else {
+        setSheetPullToast(res.message || 'ไม่สามารถดึงข้อมูลจาก Google Sheet ได้');
+      }
+    } catch (err: any) {
+      setSheetPullToast(err.message || 'เกิดข้อผิดพลาดในการดึงข้อมูล');
+    } finally {
+      setIsPullingSheet(false);
+      setTimeout(() => setSheetPullToast(null), 4000);
+    }
+  };
 
   // Save changes to storage
   const handleUpdateActivities = (newActivities: Activity[]) => {
@@ -128,8 +185,9 @@ export default function App() {
   };
 
   const handleUpdateRegistrations = (newRegistrations: Registration[]) => {
-    setRegistrations(newRegistrations);
-    saveRegistrations(newRegistrations);
+    const clean = deduplicateRegistrations(newRegistrations);
+    setRegistrations(clean);
+    saveRegistrations(clean);
   };
 
   const handleUpdateNotifications = (newNotes: NotificationItem[]) => {
@@ -163,11 +221,8 @@ export default function App() {
 
     handleUpdateActivities(updated);
 
-    // Persist to server (shared across all devices)
+    // Persist to server (which handles deduplication & Google Sheet auto-sync once)
     await postActivityToServer(activity);
-
-    // Automatically push to Google Sheet
-    appendActivityToSheet(activity).catch(e => console.warn('Auto-append activity failed:', e));
   };
 
   // Delete Activity
@@ -184,15 +239,18 @@ export default function App() {
 
   // Success Registration
   const handleRegistrationSuccess = async (newReg: Registration) => {
+    // 1. Persist to shared backend (which strictly validates and syncs to Google Sheet once)
+    const serverResult = await postRegistrationToServer(newReg);
+    if (!serverResult.success) {
+      return {
+        success: false,
+        error: serverResult.error || 'ไม่สามารถลงทะเบียนได้ หรือรหัสนักศึกษานี้ได้ลงทะเบียนกิจกรรมนี้แล้ว'
+      };
+    }
+
+    // 2. Only on server success, update client state with automatic deduplication
     const updated = [newReg, ...registrations];
     handleUpdateRegistrations(updated);
-
-    // 1. Persist to shared backend (which also pushes to Google Sheet Webhook if configured)
-    postRegistrationToServer(newReg).catch(e => console.warn('Post registration error:', e));
-
-    // 2. Client-side direct append to Google Sheet as secondary guarantee
-    const activeCount = updated.filter(r => r.activityId === newReg.activityId && r.status !== 'cancelled').length;
-    appendRegistrationToSheet(newReg, activeCount).catch(e => console.warn('Direct sheet append error:', e));
 
     // Notification item
     const note: NotificationItem = {
@@ -205,6 +263,7 @@ export default function App() {
       isRead: false
     };
     handleUpdateNotifications([note, ...notifications]);
+    return { success: true };
   };
 
   // Cancel Registration
@@ -257,14 +316,18 @@ export default function App() {
     })
     .sort((a, b) => {
       if (sortBy === 'deadline') {
-        return new Date(a.closeDate).getTime() - new Date(b.closeDate).getTime();
+        const da = parseAnyDate(a.closeDate)?.getTime() || 0;
+        const db = parseAnyDate(b.closeDate)?.getTime() || 0;
+        return da - db;
       }
       if (sortBy === 'seats') {
         const statsA = getActivityStats(a, registrations);
         const statsB = getActivityStats(b, registrations);
         return statsA.remainingSeats - statsB.remainingSeats;
       }
-      return new Date(a.eventDateTime).getTime() - new Date(b.eventDateTime).getTime();
+      const da = parseAnyDate(a.eventDateTime)?.getTime() || 0;
+      const db = parseAnyDate(b.eventDateTime)?.getTime() || 0;
+      return da - db;
     });
 
   const nextSuggestedCode = `ACT-DORM-69${String(activities.length + 1).padStart(2, '0')}`;
@@ -334,20 +397,25 @@ export default function App() {
                     <Users className="w-3.5 h-3.5 text-emerald-300" />
                     ผู้สมัครแล้วรวม: <strong>{registrations.filter(r => r.status !== 'cancelled').length} คน</strong>
                   </span>
-                  {sheetUrl && (
-                    <a
-                      href={sheetUrl}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="flex items-center gap-1.5 bg-emerald-600/80 hover:bg-emerald-600 px-3 py-1.5 rounded-xl text-white font-medium transition-colors"
-                    >
-                      <FileSpreadsheet className="w-3.5 h-3.5 text-white" />
-                      Google Sheet ซิงค์อยู่
-                    </a>
-                  )}
                 </div>
               </div>
             </div>
+
+            {/* Pull Notification Toast */}
+            {sheetPullToast && (
+              <div className="p-3 bg-purple-50 border border-purple-200 text-[#6C3994] rounded-2xl text-xs sm:text-sm font-medium flex items-center justify-between shadow-xs animate-in fade-in">
+                <div className="flex items-center gap-2">
+                  <FileSpreadsheet className="w-4 h-4 shrink-0 text-emerald-600" />
+                  <span>{sheetPullToast}</span>
+                </div>
+                <button
+                  onClick={() => setSheetPullToast(null)}
+                  className="text-slate-400 hover:text-slate-600 text-xs px-2 py-1"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
 
             {/* Filter & Search Bar */}
             <div className="bg-white rounded-3xl p-4 sm:p-5 border border-slate-200/80 shadow-xs space-y-4">
@@ -422,7 +490,50 @@ export default function App() {
             </div>
 
             {/* Activities Cards Grid */}
-            {filteredActivities.length === 0 ? (
+            {activities.length === 0 ? (
+              <div className="bg-white rounded-3xl p-10 sm:p-14 text-center border border-slate-200/80 shadow-xs space-y-4">
+                <div className="w-16 h-16 bg-purple-50 text-[#6C3994] rounded-2xl flex items-center justify-center mx-auto shadow-inner">
+                  <FileSpreadsheet className="w-8 h-8" />
+                </div>
+                <div className="space-y-1">
+                  <h3 className="text-lg font-bold text-slate-800">
+                    ระบบดึงข้อมูลจาก Google Sheet เป็นหลัก
+                  </h3>
+                  <p className="text-xs sm:text-sm text-slate-500 max-w-md mx-auto leading-relaxed">
+                    ยังไม่มีข้อมูลกิจกรรมในระบบ (ไม่มีข้อมูลตัวอย่าง) ข้อมูลกิจกรรมและรายชื่อนักศึกษาจะถูกดึงมาจาก Google Sheet โดยตรง หรือผู้ดูแลระบบสามารถสร้างกิจกรรมใหม่ได้
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+                  <button
+                    onClick={handlePullFromSheet}
+                    disabled={isPullingSheet}
+                    className="flex items-center gap-2 px-4 py-2.5 bg-gradient-to-r from-[#6C3994] to-[#8648B8] hover:from-[#562879] hover:to-[#6C3994] text-white text-xs sm:text-sm font-semibold rounded-xl shadow-md transition-all active:scale-95 disabled:opacity-50 cursor-pointer"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${isPullingSheet ? 'animate-spin' : ''}`} />
+                    <span>{isPullingSheet ? 'กำลังดึงข้อมูล...' : 'ดึงข้อมูลจาก Google Sheet ทันที'}</span>
+                  </button>
+                  <button
+                    onClick={() => setIsGoogleSheetModalOpen(true)}
+                    className="flex items-center gap-2 px-4 py-2.5 bg-emerald-50 text-emerald-800 hover:bg-emerald-100 text-xs sm:text-sm font-semibold rounded-xl border border-emerald-200 transition-colors cursor-pointer"
+                  >
+                    <FileSpreadsheet className="w-4 h-4 text-emerald-600" />
+                    <span>ตั้งค่า Google Sheet</span>
+                  </button>
+                  {isAdmin && (
+                    <button
+                      onClick={() => {
+                        setEditingActivity(null);
+                        setIsAddModalOpen(true);
+                      }}
+                      className="flex items-center gap-2 px-4 py-2.5 bg-purple-50 text-[#6C3994] hover:bg-purple-100 text-xs sm:text-sm font-semibold rounded-xl border border-purple-200 transition-colors cursor-pointer"
+                    >
+                      <PlusCircle className="w-4 h-4" />
+                      <span>เพิ่มกิจกรรมใหม่</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ) : filteredActivities.length === 0 ? (
               <div className="bg-white rounded-3xl p-12 text-center border border-slate-200/80 shadow-xs space-y-3">
                 <AlertCircle className="w-12 h-12 mx-auto text-slate-300 stroke-1" />
                 <h3 className="text-base font-bold text-slate-800">
@@ -506,6 +617,12 @@ export default function App() {
             }}
             onDeleteActivity={act => handleDeleteActivity(act)}
             onViewRoster={act => setViewingDetailActivity(act)}
+            onDataLoadedFromSheet={(newActs, newRegs) => {
+              setActivities(newActs);
+              setRegistrations(newRegs);
+              saveActivities(newActs);
+              saveRegistrations(newRegs);
+            }}
           />
         )}
       </main>
@@ -579,8 +696,17 @@ export default function App() {
           onClose={() => setIsGoogleSheetModalOpen(false)}
           activities={activities}
           registrations={registrations}
+          onDataLoadedFromSheet={(newActs, newRegs) => {
+            setActivities(newActs);
+            setRegistrations(newRegs);
+            saveActivities(newActs);
+            saveRegistrations(newRegs);
+          }}
         />
       )}
+
+      {/* 5. Live Chat & AI Chatbot Widget (Always accessible for students) */}
+      <LiveChatWidget />
     </div>
   );
 }

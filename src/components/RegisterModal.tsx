@@ -19,14 +19,14 @@ import {
 import confetti from 'canvas-confetti';
 import { Activity, Registration } from '../types';
 import { CMU_DORMITORIES, CMU_FACULTIES } from '../utils/initialData';
-import { formatThaiDateTime } from '../utils/storage';
-import { appendRegistrationToSheet, getSavedSpreadsheetUrl } from '../services/googleSheets';
+import { formatThaiDateTime, parseAnyDate } from '../utils/storage';
+import { getSavedSpreadsheetUrl } from '../services/googleSheets';
 
 interface RegisterModalProps {
   activity: Activity | null;
   existingRegistrations: Registration[];
   onClose: () => void;
-  onSuccess: (newRegistration: Registration) => void;
+  onSuccess: (newRegistration: Registration) => Promise<{ success: boolean; error?: string } | boolean | void> | void;
 }
 
 export const RegisterModal: React.FC<RegisterModalProps> = ({
@@ -47,13 +47,16 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({
 
   // Real-time capacity check
   const activeEnrolled = existingRegistrations.filter(
-    r => r.activityId === activity.id && r.status !== 'cancelled'
+    r =>
+      (r.activityId === activity.id || (r.activityCode && r.activityCode === activity.code)) &&
+      r.status !== 'cancelled'
   );
   const isFull = activeEnrolled.length >= activity.maxParticipants;
   const remainingSeats = Math.max(0, activity.maxParticipants - activeEnrolled.length);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmitting) return;
     setError(null);
 
     // Validate 9-digit CMU Student ID
@@ -68,11 +71,11 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({
       return;
     }
 
-    // Check duplicate
+    // Strict duplicate check matching by student ID and (activity ID or code)
     const alreadyRegistered = existingRegistrations.some(
       r =>
-        r.activityId === activity.id &&
-        r.studentId === cleanStudentId &&
+        (r.activityId === activity.id || (r.activityCode && r.activityCode === activity.code)) &&
+        String(r.studentId || '').trim() === cleanStudentId &&
         r.status !== 'cancelled'
     );
 
@@ -103,6 +106,14 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({
         syncedToSheet: false
       };
 
+      // Await server verification before showing celebration
+      const result = await onSuccess(newReg);
+      if (result && typeof result === 'object' && 'success' in result && result.success === false) {
+        setError(result.error || `รหัสนักศึกษา ${cleanStudentId} ได้ลงทะเบียนกิจกรรมนี้แล้ว`);
+        setIsSubmitting(false);
+        return;
+      }
+
       // Confetti celebration
       try {
         confetti({
@@ -114,20 +125,9 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({
         // Safe fallback if blocked
       }
 
-      // Try appending to Google Sheet if connected
-      try {
-        const nextCount = activeEnrolled.length + 1;
-        const sheetOk = await appendRegistrationToSheet(newReg, nextCount);
-        if (sheetOk) {
-          newReg.syncedToSheet = true;
-          setSheetSyncStatus('บันทึกข้อมูลลง Google Sheet อัตโนมัติเรียบร้อย');
-        }
-      } catch (sheetErr) {
-        console.warn('Google sheet sync skipped:', sheetErr);
-      }
-
+      // Celebration and show e-ticket
       setSuccessRegistration(newReg);
-      onSuccess(newReg);
+      setSheetSyncStatus('ลงทะเบียนสำเร็จ บันทึกข้อมูลเรียบร้อย');
     } catch (err: any) {
       setError(err?.message || 'เกิดข้อผิดพลาดในการลงทะเบียน กรุณาลองใหม่อีกครั้ง');
     } finally {
@@ -138,8 +138,18 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({
   // Download .ics calendar event
   const downloadCalendarEvent = () => {
     if (!activity) return;
-    const startStr = activity.eventDateTime.replace(/-|:|\s/g, '');
-    const endStr = (activity.eventEndDateTime || activity.eventDateTime).replace(/-|:|\s/g, '');
+    const startDate = parseAnyDate(activity.eventDateTime) || new Date();
+    const endDate = parseAnyDate(activity.eventEndDateTime) || new Date(startDate.getTime() + 7200000);
+    const formatIcs = (d: Date) => {
+      const y = d.getFullYear();
+      const m = String(d.getMonth() + 1).padStart(2, '0');
+      const day = String(d.getDate()).padStart(2, '0');
+      const h = String(d.getHours()).padStart(2, '0');
+      const min = String(d.getMinutes()).padStart(2, '0');
+      return `${y}${m}${day}T${h}${min}00`;
+    };
+    const startStr = formatIcs(startDate);
+    const endStr = formatIcs(endDate);
     const icsData = [
       'BEGIN:VCALENDAR',
       'VERSION:2.0',
@@ -147,8 +157,8 @@ export const RegisterModal: React.FC<RegisterModalProps> = ({
       'BEGIN:VEVENT',
       `UID:${activity.id}@cmu.ac.th`,
       `DTSTAMP:${new Date().toISOString().replace(/-|:|\.\d\d\d/g, '')}`,
-      `DTSTART:${startStr}00`,
-      `DTEND:${endStr}00`,
+      `DTSTART:${startStr}`,
+      `DTEND:${endStr}`,
       `SUMMARY:${activity.title}`,
       `DESCRIPTION:${activity.description} (สถานที่: ${activity.location})`,
       `LOCATION:${activity.location}`,

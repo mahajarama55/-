@@ -15,7 +15,8 @@ import {
 } from 'lucide-react';
 import { Activity } from '../types';
 import { ACTIVITY_CATEGORIES } from '../utils/initialData';
-import { appendActivityToSheet, getSavedSpreadsheetId, getSavedSpreadsheetUrl } from '../services/googleSheets';
+import { getSavedSpreadsheetId, getSavedSpreadsheetUrl } from '../services/googleSheets';
+import { normalizeDateTimeString } from '../utils/storage';
 
 interface AddEditActivityModalProps {
   activityToEdit?: Activity | null;
@@ -36,11 +37,11 @@ export const AddEditActivityModal: React.FC<AddEditActivityModalProps> = ({
   const [title, setTitle] = useState(activityToEdit?.title || '');
   const [category, setCategory] = useState<Activity['category']>(activityToEdit?.category || 'skills');
   const [location, setLocation] = useState(activityToEdit?.location || 'อาคารบริการหอพักนักศึกษา มช.');
-  const [eventDateTime, setEventDateTime] = useState(activityToEdit?.eventDateTime || '2026-11-25T13:30');
-  const [eventEndDateTime, setEventEndDateTime] = useState(activityToEdit?.eventEndDateTime || '2026-11-25T16:30');
+  const [eventDateTime, setEventDateTime] = useState(normalizeDateTimeString(activityToEdit?.eventDateTime) || '2026-11-25T13:30');
+  const [eventEndDateTime, setEventEndDateTime] = useState(normalizeDateTimeString(activityToEdit?.eventEndDateTime) || '2026-11-25T16:30');
   const [maxParticipants, setMaxParticipants] = useState<number>(activityToEdit?.maxParticipants || 50);
-  const [openDate, setOpenDate] = useState(activityToEdit?.openDate || '2026-11-04T08:00');
-  const [closeDate, setCloseDate] = useState(activityToEdit?.closeDate || '2026-11-24T18:00');
+  const [openDate, setOpenDate] = useState(normalizeDateTimeString(activityToEdit?.openDate) || '2026-11-04T08:00');
+  const [closeDate, setCloseDate] = useState(normalizeDateTimeString(activityToEdit?.closeDate) || '2026-11-24T18:00');
   const [targetAudience, setTargetAudience] = useState(activityToEdit?.targetAudience || 'นักศึกษาหอพักทุกหอ');
   const [hoursEarned, setHoursEarned] = useState<number>(activityToEdit?.hoursEarned || 3);
   const [description, setDescription] = useState(activityToEdit?.description || '');
@@ -98,19 +99,7 @@ export const AddEditActivityModal: React.FC<AddEditActivityModalProps> = ({
         updatedAt: new Date().toISOString()
       };
 
-      // Auto-append to Google Sheet if requested and connected
-      if (syncToSheet && hasSpreadsheet) {
-        try {
-          const sheetOk = await appendActivityToSheet(activityData);
-          if (sheetOk) {
-            activityData.syncedToSheet = true;
-            setSyncMessage('บันทึกข้อมูลลง Google Sheet อัตโนมัติเรียบร้อย');
-          }
-        } catch (sErr) {
-          console.warn('Could not sync activity to Google Sheet:', sErr);
-        }
-      }
-
+      activityData.syncedToSheet = true;
       onSave(activityData);
       onClose();
     } catch (err: any) {
